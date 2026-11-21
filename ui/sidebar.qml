@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Dialogs
 import "."
 
 Rectangle {
@@ -280,6 +281,15 @@ Rectangle {
                         }
                     }
                     C.MenuItemStyled {
+                        text: "Export chat…"
+                        iconName: "external"
+                        onTriggered: {
+                            exportFormatDialog.conversationId = row.id
+                            exportFormatDialog.conversationTitle = row.title
+                            exportFormatDialog.open()
+                        }
+                    }
+                    C.MenuItemStyled {
                         text: "Delete"
                         iconName: "trash"
                         destructive: true
@@ -406,5 +416,88 @@ Rectangle {
         confirmText: "Delete"
         destructive: true
         onConfirmed: backend.deleteConversation(conversationId)
+    }
+
+    // ------------------------------------------------------------ export flow
+    // Step 1: format picker (Markdown vs JSON)
+    Dialog {
+        id: exportFormatDialog
+        property string conversationId: ""
+        property string conversationTitle: ""
+        title: "Export chat"
+        modal: true
+        anchors.centerIn: parent
+        standardButtons: Dialog.Cancel
+
+        ColumnLayout {
+            spacing: 12
+            width: 260
+
+            Text {
+                text: "Choose export format:"
+                color: Theme.text
+                font.pixelSize: Theme.fontMd
+                Layout.fillWidth: true
+            }
+
+            RowLayout {
+                spacing: 8
+                Layout.fillWidth: true
+
+                AbstractButton {
+                    id: mdBtn
+                    Layout.fillWidth: true
+                    implicitHeight: 40
+                    hoverEnabled: true
+                    background: C.Glass { radius: 10; hovered: mdBtn.hovered }
+                    contentItem: ColumnLayout {
+                        spacing: 2
+                        Text { text: "Markdown"; color: Theme.text; font.pixelSize: Theme.fontMd; font.weight: Font.Medium; Layout.alignment: Qt.AlignHCenter }
+                        Text { text: ".md"; color: Theme.textTertiary; font.pixelSize: Theme.fontXs; Layout.alignment: Qt.AlignHCenter }
+                    }
+                    onClicked: {
+                        exportFormatDialog.close()
+                        exportSaveDialog.pendingFmt = "md"
+                        exportSaveDialog.pendingConversationId = exportFormatDialog.conversationId
+                        exportSaveDialog.currentFile = Qt.resolvedUrl("file:///" + backend.exportDefaultFilename(exportFormatDialog.conversationId, "md"))
+                        exportSaveDialog.open()
+                    }
+                }
+
+                AbstractButton {
+                    id: jsonBtn
+                    Layout.fillWidth: true
+                    implicitHeight: 40
+                    hoverEnabled: true
+                    background: C.Glass { radius: 10; hovered: jsonBtn.hovered }
+                    contentItem: ColumnLayout {
+                        spacing: 2
+                        Text { text: "JSON"; color: Theme.text; font.pixelSize: Theme.fontMd; font.weight: Font.Medium; Layout.alignment: Qt.AlignHCenter }
+                        Text { text: ".json"; color: Theme.textTertiary; font.pixelSize: Theme.fontXs; Layout.alignment: Qt.AlignHCenter }
+                    }
+                    onClicked: {
+                        exportFormatDialog.close()
+                        exportSaveDialog.pendingFmt = "json"
+                        exportSaveDialog.pendingConversationId = exportFormatDialog.conversationId
+                        exportSaveDialog.currentFile = Qt.resolvedUrl("file:///" + backend.exportDefaultFilename(exportFormatDialog.conversationId, "json"))
+                        exportSaveDialog.open()
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 2: native save-file dialog
+    FileDialog {
+        id: exportSaveDialog
+        property string pendingFmt: "md"
+        property string pendingConversationId: ""
+        title: "Save conversation"
+        fileMode: FileDialog.SaveFile
+        nameFilters: pendingFmt === "json" ? ["JSON files (*.json)", "All files (*)"]
+                                           : ["Markdown files (*.md)", "All files (*)"]
+        onAccepted: {
+            backend.exportConversation(pendingConversationId, selectedFile, pendingFmt)
+        }
     }
 }

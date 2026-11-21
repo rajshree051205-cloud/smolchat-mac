@@ -14,6 +14,8 @@ from app.model_manager import (
     ModelEntry,
     ModelRegistry,
     ModelStore,
+    VerificationCancelled,
+    verify_installed_model,
 )
 
 
@@ -227,3 +229,146 @@ def test_installed_scan_works_offline_from_disk_only(setup):
     ModelDownloader(store, entry, opener=FakeHub(files)).download()
     fresh = ModelStore(paths, ModelRegistry([entry]))  # e.g. after restart, no network
     assert list(fresh.installed()) == ["test-model"]
+
+
+# ------------------------------------------------------------ integrity check
+
+
+def test_valid_installed_model_passes_verification(setup):
+    _paths, files, entry, store = setup
+    ModelDownloader(store, entry, opener=FakeHub(files)).download()
+    model_dir = store.model_dir("test-model")
+    report = verify_installed_model(model_dir, entry.files, model_id="test-model")
+    assert report.all_ok
+    assert len(report.verified_files) == len(entry.files) == 2
+    assert not report.failed_files
+    for res in report.results:
+        assert res.ok
+        assert res.status == "ok"
+        assert res.actual_sha256 == res.expected_sha256
+
+
+def test_corrupted_file_same_size_fails_verification(setup):
+    _paths, files, entry, store = setup
+    ModelDownloader(store, entry, opener=FakeHub(files)).download()
+    model_dir = store.model_dir("test-model")
+
+    # Corrupt model.gguf keeping the exact same byte length
+    corrupted_data = b"x" * len(files["model.gguf"])
+    (model_dir / "model.gguf").write_bytes(corrupted_data)
+
+    report = verify_installed_model(model_dir, entry.files, model_id="test-model")
+    assert not report.all_ok
+    assert len(report.verified_files) == 1
+    assert len(report.failed_files) == 1
+
+    failed = report.failed_files[0]
+    assert failed.filename == "model.gguf"
+    assert failed.status == "corrupt"
+    assert failed.expected_sha256 != failed.actual_sha256
+    assert failed.actual_size == len(corrupted_data)
+    assert "Checksum mismatch" in failed.error_message
+
+
+def test_missing_model_file_reported_correctly(setup):
+    _paths, files, entry, store = setup
+    ModelDownloader(store, entry, opener=FakeHub(files)).download()
+    model_dir = store.model_dir("test-model")
+
+    # Remove mmproj.gguf
+    (model_dir / "mmproj.gguf").unlink()
+
+    report = verify_installed_model(model_dir, entry.files, model_id="test-model")
+    assert not report.all_ok
+    assert len(report.verified_files) == 1
+    assert len(report.failed_files) == 1
+
+    failed = report.failed_files[0]
+    assert failed.filename == "mmproj.gguf"
+    assert failed.status == "missing"
+    assert "Missing file" in failed.error_message
+
+
+def test_unreadable_file_handled_safely(setup, monkeypatch):
+    _paths, files, entry, store = setup
+    ModelDownloader(store, entry, opener=FakeHub(files)).download()
+    model_dir = store.model_dir("test-model")
+
+    from pathlib import Path
+    orig_open = Path.open
+
+    def failing_open(self, *args, **kwargs):
+        if self.name == "model.gguf":
+            raise PermissionError("Access denied")
+        return orig_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+
+    report = verify_installed_model(model_dir, [entry.files[0]], model_id="test-model")
+    assert not report.all_ok
+    assert len(report.failed_files) == 1
+    failed = report.failed_files[0]
+    assert failed.filename == "model.gguf"
+    assert failed.status == "unreadable"
+    assert "Access denied" in failed.error_message
+
+
+def test_cancellation_during_chunked_hashing(setup):
+    _paths, files, entry, store = setup
+    ModelDownloader(store, entry, opener=FakeHub(files)).download()
+    model_dir = store.model_dir("test-model")
+
+    stop_flag = False
+
+    def should_stop():
+        return stop_flag
+
+    def on_progress(p):
+        nonlocal stop_flag
+        if p.verified_bytes > 0:
+            stop_flag = True
+
+    with pytest.raises(VerificationCancelled):
+        verify_installed_model(
+            model_dir,
+            entry.files,
+            on_progress=on_progress,
+            should_stop=should_stop,
+            model_id="test-model",
+        )
+
+
+def test_multiple_model_files_checked_and_correct_failures_identified(setup):
+    _paths, files, entry, store = setup
+    ModelDownloader(store, entry, opener=FakeHub(files)).download()
+    model_dir = store.model_dir("test-model")
+
+    # Leave model.gguf intact, corrupt mmproj.gguf
+    (model_dir / "mmproj.gguf").write_bytes(b"corrupt")
+
+    report = verify_installed_model(model_dir, entry.files, model_id="test-model")
+    assert not report.all_ok
+    assert len(report.verified_files) == 1
+    assert report.verified_files[0].filename == "model.gguf"
+    assert len(report.failed_files) == 1
+    assert report.failed_files[0].filename == "mmproj.gguf"
+    assert report.failed_files[0].status == "corrupt"
+
+
+def test_progress_reporting_callback(setup):
+    _paths, files, entry, store = setup
+    ModelDownloader(store, entry, opener=FakeHub(files)).download()
+    model_dir = store.model_dir("test-model")
+
+    progress_events = []
+    report = verify_installed_model(
+        model_dir,
+        entry.files,
+        on_progress=progress_events.append,
+        model_id="test-model",
+    )
+    assert report.all_ok
+    assert len(progress_events) >= 2
+    assert progress_events[-1].verified_bytes == sum(f.size for f in entry.files)
+    assert progress_events[-1].fraction == 1.0
+    assert progress_events[0].stage == "verifying"

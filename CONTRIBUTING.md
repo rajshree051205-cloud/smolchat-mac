@@ -14,7 +14,8 @@ Thanks for helping improve SmolChat! This guide walks you through everything fro
 8. [Project rules](#8-project-rules)
 9. [Labels and WOCS points](#9-labels-and-wocs-points)
 10. [Reporting bugs and suggesting features](#10-reporting-bugs-and-suggesting-features)
-11. [Advanced topics](#11-advanced-topics)
+11. [Cutting a release](#11-cutting-a-release)
+12. [Advanced topics](#12-advanced-topics)
 
 ## 1. How contributing works
 
@@ -350,7 +351,78 @@ Check the [existing issues](https://github.com/smollabs/smolchat-mac/issues) fir
 
 Remove anything private from logs and screenshots before posting.
 
-## 11. Advanced topics
+## 11. Cutting a release
+
+SmolChat uses an automated GitHub Actions release workflow (`.github/workflows/release.yml`) to build, test, package, and draft releases on version tags.
+
+### 1. Where the application version is maintained
+The version string is maintained across the following files (keep them in sync):
+- `pyproject.toml` (authoritative): `[project] version = "X.Y.Z"`
+- `app/config.py`: `APP_VERSION = "X.Y.Z"`
+- `packaging/SmolChat.spec`: `"CFBundleShortVersionString": "X.Y.Z"`
+
+### 2. Updating the application version
+Before cutting a new release, bump the version string in `pyproject.toml`, `app/config.py`, and `packaging/SmolChat.spec`. Commit these changes to `main`:
+```bash
+git add pyproject.toml app/config.py packaging/SmolChat.spec
+git commit -m "Bump version to X.Y.Z"
+git push origin main
+```
+
+### 3. Running tests before releasing
+Verify that all unit and integration tests pass locally:
+```bash
+pytest
+```
+
+### 4. Creating and pushing a version tag
+Create an annotated or lightweight Git tag starting with `v` matching the exact version in `pyproject.toml`:
+```bash
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+### 5. How GitHub Actions builds the application
+Pushing a `v*` tag triggers the `Release` workflow on a `macos-14` (Apple Silicon ARM64) runner:
+1. Validates that the runner architecture is `arm64`.
+2. Validates that the tag version (without `v`) matches `pyproject.toml`, `app/config.py`, and `packaging/SmolChat.spec`.
+3. Sets up Python 3.12 and installs dependencies with Metal GPU acceleration enabled (`CMAKE_ARGS="-DGGML_METAL=on"`).
+4. Runs the `pytest` test suite.
+5. Executes `scripts/build_macos.sh` to package `dist/SmolChat.app` via PyInstaller (without bundling model weights).
+6. Optionally signs the `.app` bundle if Apple signing secrets are present.
+7. Executes `scripts/make_dmg.sh` to create the standalone DMG disk image `dist/SmolChat-<version>.dmg`.
+8. Optionally signs and notarizes the DMG via `xcrun notarytool` and staples the ticket.
+9. Computes the SHA-256 checksum and writes `dist/SmolChat-<version>.dmg.sha256`.
+
+### 6. Draft GitHub Release
+The workflow creates a **Draft GitHub Release** with the tag name and uploads:
+- `SmolChat-<version>.dmg`
+- `SmolChat-<version>.dmg.sha256`
+
+The release remains as a draft so maintainers can review release notes and assets before publishing.
+
+### 7. Downloading and verifying the DMG
+After downloading `SmolChat-<version>.dmg` and `SmolChat-<version>.dmg.sha256` from the draft release, verify the checksum in the terminal:
+```bash
+shasum -a 256 -c SmolChat-1.2.3.dmg.sha256
+```
+Or generate and compare the hash manually:
+```bash
+shasum -a 256 SmolChat-1.2.3.dmg
+```
+
+### 8. Optional Apple Developer signing and notarization
+To produce signed and notarized DMGs that pass macOS Gatekeeper without warnings, configure the following repository secrets in GitHub (`Settings -> Secrets and variables -> Actions`):
+- `APPLE_CERTIFICATE_BASE64`: Base64-encoded Developer ID Application `.p12` certificate.
+- `APPLE_CERTIFICATE_PASSWORD`: Password for the exported `.p12` certificate.
+- `APPLE_SIGNING_IDENTITY`: Signing identity name (e.g., `Developer ID Application: Your Name (TEAMID)`).
+- `APPLE_ID`: Apple Developer account email address.
+- `APPLE_APP_SPECIFIC_PASSWORD`: App-specific password generated on appleid.apple.com.
+- `APPLE_TEAM_ID`: 10-character Apple Developer Team ID.
+
+If these secrets are not configured or are only partially configured (such as on community forks), the workflow skips signing and notarization cleanly, still generating a functional unsigned DMG and draft release.
+
+## 12. Advanced topics
 
 ### Adding or updating a model
 

@@ -199,6 +199,7 @@ Popup {
                 required property string compatReason
                 required property bool canDownload
                 required property bool bestMatch
+                required property bool canRedownload
 
                 readonly property bool shown: library.matches(category, installed, compat)
                 readonly property color compatColor: compat === "recommended" ? Theme.success
@@ -229,10 +230,51 @@ Popup {
                     anchors.leftMargin: 10
                     anchors.rightMargin: 10
                     radius: Theme.radiusMd
-                    color: rowHover.hovered ? Theme.hover : "transparent"
+                    color: (rowHover.hovered || contextMenu.visible) ? Theme.hover : "transparent"
                     Behavior on color { ColorAnimation { duration: Theme.fast } }
                 }
                 HoverHandler { id: rowHover }
+
+                MouseArea {
+                    anchors.fill: parent
+                    acceptedButtons: Qt.RightButton
+                    onClicked: (mouse) => {
+                        if (row.installed && !row.downloading) {
+                            contextMenu.popup()
+                        }
+                    }
+                }
+
+                C.MenuStyled {
+                    id: contextMenu
+                    C.MenuItemStyled {
+                        text: "Verify files"
+                        iconName: "check"
+                        onTriggered: backend.verifyModelFiles(row.id)
+                    }
+                    C.MenuItemStyled {
+                        text: "Re-download"
+                        iconName: "download"
+                        visible: row.canRedownload
+                        onTriggered: backend.redownloadCorruptedFiles(row.id)
+                    }
+                    C.MenuSeparatorStyled {}
+                    C.MenuItemStyled {
+                        text: "Delete"
+                        iconName: "trash"
+                        destructive: true
+                        onTriggered: {
+                            const blocker = backend.deleteBlocker(row.id)
+                            deleteDialog.modelId = row.id
+                            deleteDialog.blocked = blocker !== ""
+                            deleteDialog.title = blocker ? "Model in use" : "Delete " + row.name + "?"
+                            deleteDialog.message = blocker
+                                ? blocker
+                                : "This removes " + row.sizeText + " of model files from this Mac. You can download it again at any time."
+                            deleteDialog.open()
+                        }
+                    }
+                }
 
                 RowLayout {
                     id: content
@@ -358,7 +400,7 @@ Popup {
                         Text {
                             visible: row.error !== "" && !row.downloading
                             text: row.error
-                            color: Theme.danger
+                            color: row.error === "All files verified." ? Theme.success : Theme.danger
                             font.pixelSize: Theme.fontXs + 1
                             wrapMode: Text.Wrap
                             Layout.fillWidth: true
@@ -427,33 +469,48 @@ Popup {
                             onClicked: backend.cancelDownload(row.id)
                         }
                         C.ActionButton {
-                            visible: row.installed
+                            visible: row.installed && row.canRedownload && !row.downloading
                             kind: "secondary"
                             compact: true
                             text: "Use in this chat"
                             accessibleName: "Use " + row.name + " in this chat"
                             accessibleDescription: "Select this model for current conversation"
                             Layout.alignment: Qt.AlignRight
-                            onClicked: { backend.selectModel(row.id); library.close() }
+                            onClicked: backend.redownloadCorruptedFiles(row.id)
                         }
                         C.ActionButton {
-                            visible: row.installed
-                            kind: "ghost"
+                            visible: row.installed && !row.downloading
+                            kind: "secondary"
                             compact: true
                             iconName: "trash"
                             text: "Delete"
                             accessibleName: "Delete " + row.name
                             accessibleDescription: "Remove model files from this Mac (" + row.sizeText + ")"
                             Layout.alignment: Qt.AlignRight
-                            onClicked: {
-                                const blocker = backend.deleteBlocker(row.id)
-                                deleteDialog.modelId = row.id
-                                deleteDialog.blocked = blocker !== ""
-                                deleteDialog.title = blocker ? "Model in use" : "Delete " + row.name + "?"
-                                deleteDialog.message = blocker
-                                    ? blocker
-                                    : "This removes " + row.sizeText + " of model files from this Mac. You can download it again at any time."
-                                deleteDialog.open()
+                            spacing: 4
+
+                            C.ActionButton {
+                                kind: "ghost"
+                                compact: true
+                                iconName: "trash"
+                                text: "Delete"
+                                onClicked: {
+                                    const blocker = backend.deleteBlocker(row.id)
+                                    deleteDialog.modelId = row.id
+                                    deleteDialog.blocked = blocker !== ""
+                                    deleteDialog.title = blocker ? "Model in use" : "Delete " + row.name + "?"
+                                    deleteDialog.message = blocker
+                                        ? blocker
+                                        : "This removes " + row.sizeText + " of model files from this Mac. You can download it again at any time."
+                                    deleteDialog.open()
+                                }
+                            }
+                            C.IconButton {
+                                id: moreBtn
+                                iconName: "more"
+                                iconSize: 16
+                                tip: "Options"
+                                onClicked: contextMenu.popup(moreBtn, 0, moreBtn.height)
                             }
                         }
                     }

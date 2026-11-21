@@ -402,6 +402,9 @@ Popup {
                 }
                 SettingRow {
                     label: "Maximum response length"
+                    hint: backend.maxTokens >= backend.contextLength
+                          ? "Too long for the context window. Replies are limited to half of the window."
+                          : ""
                     Segmented {
                         accessibleName: "Maximum response length"
                         options: [{ key: "512", label: "512" }, { key: "1024", label: "1K" }, { key: "2048", label: "2K" }, { key: "4096", label: "4K" }]

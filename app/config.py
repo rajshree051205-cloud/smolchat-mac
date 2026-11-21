@@ -22,6 +22,7 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -94,6 +95,11 @@ class AppPaths:
             path.mkdir(parents=True, exist_ok=True)
 
 
+ALLOWED_THEMES = {"dark", "light", "system"}
+ALLOWED_ACCENTS = {"blue", "violet", "green", "orange", "pink", "graphite"}
+ALLOWED_ROUTING_PREFERENCES = {"speed", "balanced", "quality"}
+
+
 @dataclass
 class Settings:
     """User-configurable preferences persisted as JSON."""
@@ -111,6 +117,96 @@ class Settings:
     # SmolLM3 can "think" before answering; slower but better at hard problems.
     enable_thinking: bool = False
 
+    def __post_init__(self) -> None:
+        for f in fields(self):
+            val = getattr(self, f.name)
+            setattr(self, f.name, self.validate_or_default(f.name, val))
+
+    @classmethod
+    def validate_value(cls, key: str, value: Any) -> Any:
+        """Validate and coerce value for a Settings field.
+
+        Raises TypeError or ValueError if the value is invalid.
+        """
+        if key == "theme":
+            if not isinstance(value, str) or value not in ALLOWED_THEMES:
+                raise ValueError(f"theme must be one of {sorted(ALLOWED_THEMES)}, got {value!r}")
+            return value
+
+        if key == "accent":
+            if not isinstance(value, str) or value not in ALLOWED_ACCENTS:
+                raise ValueError(f"accent must be one of {sorted(ALLOWED_ACCENTS)}, got {value!r}")
+            return value
+
+        if key == "routing_preference":
+            if not isinstance(value, str) or value not in ALLOWED_ROUTING_PREFERENCES:
+                raise ValueError(
+                    f"routing_preference must be one of {sorted(ALLOWED_ROUTING_PREFERENCES)}, got {value!r}"
+                )
+            return value
+
+        if key in ("default_model_id", "system_prompt"):
+            if not isinstance(value, str):
+                raise TypeError(f"{key} must be a string, got {type(value).__name__}")
+            return value
+
+        if key == "temperature":
+            if isinstance(value, bool):
+                raise TypeError("temperature must be a number, got bool")
+            try:
+                val = float(value)
+            except (TypeError, ValueError):
+                raise TypeError(f"temperature must be a number, got {value!r}")
+            if not (0.0 <= val <= 2.0):
+                raise ValueError(f"temperature must be between 0.0 and 2.0, got {val}")
+            return val
+
+        if key == "max_tokens":
+            if isinstance(value, bool):
+                raise TypeError("max_tokens must be an integer, got bool")
+            try:
+                val = int(value)
+            except (TypeError, ValueError):
+                raise TypeError(f"max_tokens must be an integer, got {value!r}")
+            if not (16 <= val <= 16384):
+                raise ValueError(f"max_tokens must be between 16 and 16384, got {val}")
+            return val
+
+        if key == "context_length":
+            if isinstance(value, bool):
+                raise TypeError("context_length must be an integer, got bool")
+            try:
+                val = int(value)
+            except (TypeError, ValueError):
+                raise TypeError(f"context_length must be an integer, got {value!r}")
+            if not (512 <= val <= 32768):
+                raise ValueError(f"context_length must be between 512 and 32768, got {val}")
+            return val
+
+        if key in ("use_gpu", "enable_thinking"):
+            if not isinstance(value, bool):
+                raise TypeError(f"{key} must be a boolean, got {type(value).__name__}")
+            return value
+
+        raise ValueError(f"Unknown setting key {key!r}")
+
+    @classmethod
+    def validate_or_default(cls, key: str, value: Any) -> Any:
+        """Validate value for key; log a warning and return default on failure."""
+        defaults = {f.name: f.default for f in fields(cls)}
+        default_val = defaults.get(key)
+        try:
+            return cls.validate_value(key, value)
+        except (TypeError, ValueError) as exc:
+            log.warning(
+                "Invalid value %r for setting %r: %s; falling back to default %r",
+                value,
+                key,
+                exc,
+                default_val,
+            )
+            return default_val
+
     @classmethod
     def load(cls, path: Path) -> "Settings":
         try:
@@ -120,11 +216,14 @@ class Settings:
         except (OSError, ValueError) as exc:
             log.warning("Ignoring unreadable settings file %s: %s", path, exc)
             return cls()
+        if not isinstance(raw, dict):
+            log.warning("Ignoring non-dictionary settings file %s", path)
+            return cls()
         known = {f.name: f for f in fields(cls)}
         values = {}
         for key, value in raw.items():
             if key in known:
-                values[key] = value
+                values[key] = cls.validate_or_default(key, value)
         try:
             return cls(**values)
         except TypeError:

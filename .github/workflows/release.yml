@@ -1,0 +1,238 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release macOS ARM64
+    runs-on: macos-14
+    env:
+      HAS_APP_SIGNING_SECRETS: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
+      HAS_NOTARIZATION_SECRETS: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_SIGNING_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify macOS ARM64 architecture
+        run: |
+          echo "Checking system architecture..."
+          ARCH=$(uname -m)
+          echo "Architecture: $ARCH"
+          if [ "$ARCH" != "arm64" ]; then
+            echo "Error: Expected arm64 architecture, got $ARCH" >&2
+            exit 1
+          fi
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Validate Tag and Application Version
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME}"
+          echo "Triggered git tag: ${TAG_NAME}"
+
+          # Extract tag version (strip leading 'v')
+          TAG_VERSION="${TAG_NAME#v}"
+          echo "Parsed tag version: ${TAG_VERSION}"
+
+          # Extract authoritative application version from pyproject.toml
+          APP_VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          echo "Authoritative application version (pyproject.toml): ${APP_VERSION}"
+
+          # Extract app/config.py version
+          CONFIG_VERSION=$(python3 -c "import app.config; print(app.config.APP_VERSION)")
+          echo "Application config version (app/config.py): ${CONFIG_VERSION}"
+
+          # Extract packaging/SmolChat.spec version using Python AST
+          SPEC_VERSION=$(python3 -c "import ast; tree = ast.parse(open('packaging/SmolChat.spec').read()); vals = [v.value for node in ast.walk(tree) if isinstance(node, ast.Dict) for k, v in zip(node.keys, node.values) if isinstance(k, ast.Constant) and k.value == 'CFBundleShortVersionString' and isinstance(v, ast.Constant)]; print(vals[0] if vals else '')")
+          echo "PyInstaller spec version (packaging/SmolChat.spec): ${SPEC_VERSION}"
+
+          if [ -z "${SPEC_VERSION}" ]; then
+            echo "Error: Could not extract CFBundleShortVersionString from packaging/SmolChat.spec" >&2
+            exit 1
+          fi
+
+          if [ "${TAG_VERSION}" != "${APP_VERSION}" ]; then
+            echo "Error: Tag version (${TAG_VERSION}) does not match pyproject.toml version (${APP_VERSION})" >&2
+            exit 1
+          fi
+
+          if [ "${APP_VERSION}" != "${CONFIG_VERSION}" ]; then
+            echo "Error: pyproject.toml version (${APP_VERSION}) does not match app/config.py version (${CONFIG_VERSION})" >&2
+            exit 1
+          fi
+
+          if [ "${APP_VERSION}" != "${SPEC_VERSION}" ]; then
+            echo "Error: pyproject.toml version (${APP_VERSION}) does not match packaging/SmolChat.spec version (${SPEC_VERSION})" >&2
+            exit 1
+          fi
+
+          echo "VERSION=${APP_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        env:
+          CMAKE_ARGS: "-DGGML_METAL=on"
+        run: |
+          python3 -m pip install --upgrade pip
+          # Install dependencies with Metal support compiled into llama-cpp-python from source
+          pip install --no-binary llama-cpp-python -e ".[dev,package]"
+
+      - name: Run test suite
+        run: |
+          pytest
+
+      - name: Build macOS Application (.app)
+        run: |
+          chmod +x scripts/build_macos.sh
+          PYTHON=python3 ./scripts/build_macos.sh
+
+      - name: Validate built application bundle
+        run: |
+          APP="dist/SmolChat.app"
+          if [ ! -d "$APP" ]; then
+            echo "Error: Application bundle $APP was not created." >&2
+            exit 1
+          fi
+
+          EXECUTABLE="$APP/Contents/MacOS/SmolChat"
+          if [ ! -f "$EXECUTABLE" ] || [ ! -s "$EXECUTABLE" ]; then
+            echo "Error: Executable $EXECUTABLE is missing or empty." >&2
+            exit 1
+          fi
+
+          FILE_INFO=$(file "$EXECUTABLE")
+          echo "Executable file info: $FILE_INFO"
+          if echo "$FILE_INFO" | grep -q "Mach-O 64-bit executable arm64" && ! echo "$FILE_INFO" | grep -qi "universal"; then
+            echo "Verified: Executable is an arm64-only binary."
+          else
+            echo "Error: Executable must be arm64-only (not universal or other architectures). Got: $FILE_INFO" >&2
+            exit 1
+          fi
+
+          # Verify no model weights (.gguf) are bundled in dist/SmolChat.app
+          GGUF_COUNT=$(find "$APP" -name "*.gguf" | wc -l | tr -d ' ')
+          if [ "$GGUF_COUNT" -ne 0 ]; then
+            echo "Error: Found bundled model weights (*.gguf) in $APP" >&2
+            exit 1
+          fi
+          echo "Verified: No model weights bundled in application."
+
+      - name: Code sign application (optional)
+        if: ${{ env.HAS_APP_SIGNING_SECRETS == 'true' }}
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          echo "Signing secrets detected. Setting up temporary keychain..."
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+
+          # Trap for cleaning up keychain and certificate files upon exit or error
+          trap 'rm -f "$CERT_PATH"; security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true' EXIT
+
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          echo "Signing dist/SmolChat.app..."
+          codesign --deep --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" --keychain "$KEYCHAIN_PATH" dist/SmolChat.app
+
+          echo "Verifying application signature..."
+          codesign --verify --deep --strict --verbose=2 dist/SmolChat.app
+
+      - name: Build DMG disk image
+        run: |
+          chmod +x scripts/make_dmg.sh
+          ./scripts/make_dmg.sh
+
+      - name: Validate built DMG
+        run: |
+          DMG="dist/SmolChat-${VERSION}.dmg"
+          if [ ! -f "$DMG" ] || [ ! -s "$DMG" ]; then
+            echo "Error: DMG file $DMG was not created or is empty." >&2
+            exit 1
+          fi
+          echo "Verified: $DMG exists and is non-empty ($(ls -lh "$DMG" | awk '{print $5}'))."
+
+      - name: Code sign and notarize DMG (optional)
+        if: ${{ env.HAS_NOTARIZATION_SECRETS == 'true' }}
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          echo "Signing and notarization credentials detected."
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+
+          trap 'rm -f "$CERT_PATH"; security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true' EXIT
+
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          DMG="dist/SmolChat-${VERSION}.dmg"
+
+          echo "Signing DMG..."
+          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" --keychain "$KEYCHAIN_PATH" "$DMG"
+
+          echo "Verifying DMG signature..."
+          codesign --verify --strict --verbose=2 "$DMG"
+
+          echo "Submitting DMG for notarization..."
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          echo "Stapling notarization ticket to DMG..."
+          xcrun stapler staple "$DMG"
+
+          echo "Validating stapled notarization..."
+          xcrun stapler validate "$DMG"
+
+      - name: Generate SHA-256 Checksum
+        run: |
+          DMG_NAME="SmolChat-${VERSION}.dmg"
+          cd dist
+          shasum -a 256 "$DMG_NAME" > "${DMG_NAME}.sha256"
+          echo "Generated checksum file dist/${DMG_NAME}.sha256:"
+          cat "${DMG_NAME}.sha256"
+          # Verify checksum matches
+          shasum -a 256 -c "${DMG_NAME}.sha256"
+
+      - name: Create Draft GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: SmolChat ${{ github.ref_name }}
+          draft: true
+          prerelease: false
+          files: |
+            dist/SmolChat-${{ env.VERSION }}.dmg
+            dist/SmolChat-${{ env.VERSION }}.dmg.sha256

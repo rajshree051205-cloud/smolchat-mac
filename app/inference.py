@@ -70,6 +70,20 @@ class InferenceError(Exception):
     """A user-presentable runtime failure."""
 
 
+# Tokens kept free for chat-template markers around the prompt.
+PROMPT_OVERHEAD_TOKENS = 64
+
+
+def effective_max_tokens(max_tokens: int, context_length: int) -> int:
+    """The response length that fits a model with ``context_length`` tokens of context.
+
+    The reply may use at most half of the context, so the other half stays for the
+    prompt and the chat history. The Maximum response length setting can be larger
+    than that (4K on a 2K model), and llama.cpp rejects prompt + max_tokens > n_ctx.
+    """
+    return max(1, min(max_tokens, context_length // 2))
+
+
 TokenCallback = Callable[[str], None]
 StopCheck = Callable[[], bool]
 
@@ -144,9 +158,33 @@ class LlamaCppEngine(InferenceEngine):
                 "The llama.cpp runtime (llama-cpp-python) is not installed or failed to load."
             ) from exc
         if not spec.model_path.is_file():
-            raise InferenceError(f"Model file is missing: {spec.model_path.name}")
+            raise InferenceError(
+                f"Model file is missing: {spec.model_path.name}. "
+                "Try running 'Verify files' from the Model Library."
+            )
+        try:
+            with spec.model_path.open("rb") as f:
+                f.read(1024)
+        except OSError as exc:
+            raise InferenceError(
+                f"Model file cannot be read: {spec.model_path.name} ({exc}). "
+                "Try running 'Verify files' from the Model Library."
+            ) from exc
         chat_handler = None
         if spec.mmproj_path is not None:
+            if not spec.mmproj_path.is_file():
+                raise InferenceError(
+                    f"Multimodal projector file is missing: {spec.mmproj_path.name}. "
+                    "Try running 'Verify files' from the Model Library."
+                )
+            try:
+                with spec.mmproj_path.open("rb") as f:
+                    f.read(1024)
+            except OSError as exc:
+                raise InferenceError(
+                    f"Multimodal projector file cannot be read: {spec.mmproj_path.name} ({exc}). "
+                    "Try running 'Verify files' from the Model Library."
+                ) from exc
             chat_handler = _vision_chat_handler(spec)
         threads = max(1, (os.cpu_count() or 4) - 2)
         try:
@@ -160,7 +198,11 @@ class LlamaCppEngine(InferenceEngine):
             )
         except Exception as exc:
             self._llm = None
-            raise InferenceError(f"llama.cpp could not load the model: {exc}") from exc
+            raise InferenceError(
+                f"llama.cpp could not load the model: {exc}. "
+                "The file may be corrupted or incompatible. "
+                "Try running 'Verify files' from the Model Library."
+            ) from exc
         self._spec = spec
         self._vision = chat_handler is not None
 
@@ -187,7 +229,8 @@ class LlamaCppEngine(InferenceEngine):
     ) -> GenerationResult:
         if self._llm is None or self._spec is None:
             raise InferenceError("No model is loaded.")
-        payload = self._fit_context(messages, params.max_tokens)
+        max_tokens = effective_max_tokens(params.max_tokens, self._spec.context_length)
+        payload = self._fit_context(messages, max_tokens)
         start = time.monotonic()
         pieces: list[str] = []
         tokens = 0
@@ -200,7 +243,7 @@ class LlamaCppEngine(InferenceEngine):
                 temperature=params.temperature,
                 top_p=params.top_p,
                 repeat_penalty=params.repeat_penalty,
-                max_tokens=params.max_tokens,
+                max_tokens=max_tokens,
                 stop=SMOLVLM_STOP if self._vision else None,
             )
             for chunk in stream:
@@ -225,7 +268,7 @@ class LlamaCppEngine(InferenceEngine):
     def _fit_context(self, messages: list[ChatMessage], max_tokens: int) -> list[dict]:
         """Drop the oldest turns until the prompt fits the context window."""
         assert self._llm is not None and self._spec is not None
-        budget = self._spec.context_length - max_tokens - 64
+        budget = max(0, self._spec.context_length - max_tokens - PROMPT_OVERHEAD_TOKENS)
         system = [m for m in messages if m.role == "system"]
         rest = [m for m in messages if m.role != "system"]
 
@@ -234,9 +277,21 @@ class LlamaCppEngine(InferenceEngine):
             return n + 8 + 600 * len(m.images)  # role markers + image embedding budget
 
         used = sum(cost(m) for m in system)
+        if not rest and used > budget:
+            raise InferenceError(
+                f"The prompt is too long for {self._spec.model_id}'s context window "
+                f"(~{self._spec.context_length} tokens). Shorten it, increase the context "
+                "size in Settings, or pick a model with a larger context window."
+            )
         kept: list[ChatMessage] = []
         for m in reversed(rest):
             c = cost(m)
+            if not kept and used + c > budget:
+                raise InferenceError(
+                    f"This message is too long for {self._spec.model_id}'s context window "
+                    f"(~{self._spec.context_length} tokens). Shorten it, increase the context "
+                    "size in Settings, or pick a model with a larger context window."
+                )
             if kept and used + c > budget:
                 break
             kept.append(m)

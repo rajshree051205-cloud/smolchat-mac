@@ -36,6 +36,7 @@ from PySide6.QtSvg import QSvgRenderer
 
 from .config import AppPaths, HardwareInfo, Settings, available_memory_bytes, resource_root
 from .database import ChatDatabase, Conversation, suggest_title
+from .export import conversation_to_json, conversation_to_markdown, default_filename
 from .formatting import DARK_SYNTAX, LIGHT_SYNTAX, segment_message, strip_reasoning
 from .inference import (
     ChatMessage,
@@ -53,12 +54,16 @@ from .model_manager import (
     DownloadProgress,
     ModelDownloader,
     ModelEntry,
+    ModelIntegrityReport,
     ModelRegistry,
     ModelStore,
+    VerificationCancelled,
+    VerificationProgress,
     assess_compatibility,
     best_matches,
     format_bytes,
     format_eta,
+    verify_installed_model,
 )
 from .model_router import RouteRequest, SystemState, route
 
@@ -240,6 +245,8 @@ class Backend(QObject):
     _initDone = Signal(object)
     _downloadProgress = Signal(object)
     _downloadFinished = Signal(str, str)  # model id, error ("" = success, "cancelled")
+    _verifyProgress = Signal(object)
+    _verifyFinished = Signal(str, object, str)  # model id, report (or None), error ("" = ok, "cancelled", or msg)
     _genEvent = Signal(str, object)  # kind, payload
 
     def __init__(self, paths: AppPaths, parent: QObject | None = None):
@@ -260,6 +267,9 @@ class Backend(QObject):
         self._installed: dict[str, Any] = {}
         self._downloads: dict[str, ModelDownloader] = {}
         self._download_errors: dict[str, str] = {}
+        self._verifications: dict[str, threading.Event] = {}
+        self._corrupt_files: dict[str, list[str]] = {}
+        self._verification_messages: dict[str, str] = {}
         self._recommended: dict[str, Any] = {}
 
         self._conversation: Conversation | None = None
@@ -288,7 +298,7 @@ class Backend(QObject):
              "quantization", "sizeText", "ramText", "source", "license", "supported",
              "unsupportedReason", "installed", "downloading", "progress", "progressText",
              "stage", "error", "partial", "loaded", "loading", "repoUrl", "compat", "compatLabel",
-             "compatReason", "canDownload", "bestMatch",
+             "compatReason", "canDownload", "bestMatch", "canRedownload",
              "contextLength"],
             self,
         )
@@ -296,6 +306,8 @@ class Backend(QObject):
         self._initDone.connect(self._on_init_done)
         self._downloadProgress.connect(self._on_download_progress)
         self._downloadFinished.connect(self._on_download_finished)
+        self._verifyProgress.connect(self._on_verify_progress)
+        self._verifyFinished.connect(self._on_verify_finished)
         self._genEvent.connect(self._on_gen_event)
 
     # ================================================================ startup
@@ -548,6 +560,47 @@ class Backend(QObject):
         if self._conversation and self._conversation.id == conversation_id:
             self.newChat()
         self.reload_conversations()
+
+    @Slot(str, str, str, result=bool)
+    def exportConversation(  # noqa: N802
+        self, conversation_id: str, file_path: str, fmt: str
+    ) -> bool:
+        """Export *conversation_id* to *file_path* in *fmt* (``"md"`` or ``"json"``).
+
+        Called from QML after the user picks a save location via FileDialog.
+        Returns ``True`` on success, ``False`` on any error (a toast is shown).
+        """
+        conv = self.db.get_conversation(conversation_id)
+        if conv is None:
+            self.toast.emit("Could not find that conversation.", "error")
+            return False
+        msgs = self.db.messages(conversation_id)
+        try:
+            if fmt == "json":
+                text = conversation_to_json(conv, msgs)
+            else:
+                text = conversation_to_markdown(conv, msgs)
+            # QML passes a file:// URL on macOS; normalise to a plain path.
+            path = QUrl(file_path).toLocalFile() if file_path.startswith("file:") else file_path
+            Path(path).write_text(text, encoding="utf-8")
+            self.toast.emit("Conversation exported successfully.", "info")
+            return True
+        except OSError as exc:
+            log.warning("Export failed: %s", exc)
+            self.toast.emit(f"Export failed: {exc.strerror}", "error")
+            return False
+        except Exception as exc:  # pragma: no cover
+            log.exception("Unexpected export error")
+            self.toast.emit(f"Export failed: {exc}", "error")
+            return False
+
+    @Slot(str, str, result=str)
+    def exportDefaultFilename(self, conversation_id: str, fmt: str) -> str:  # noqa: N802
+        """Return a sensible default save filename for *conversation_id*."""
+        conv = self.db.get_conversation(conversation_id)
+        if conv is None:
+            return f"conversation.{fmt}"
+        return default_filename(conv, fmt)
 
     # ============================================================ model state
 
@@ -1034,14 +1087,20 @@ class Backend(QObject):
             ram_need = e.estimated_ram_bytes(ctx)
             partial = self.store.partial_bytes(e.id)
             compat = assess_compatibility(e, device, ctx, partial)
-            if downloading:
+            verifying = e.id in self._verifications
+            active = downloading or verifying
+            if active:
                 progress = current.get("progress", 0.0)
                 progress_text = current.get("progressText", "")
-                stage = current.get("stage", "")
+                stage = current.get("stage", "verifying" if verifying else "")
             else:
                 progress = partial / e.download_size if e.download_size else 0.0
                 progress_text = self._progress_text(partial, e.download_size) if partial else ""
                 stage = ""
+            status_error = self._download_errors.get(e.id, "")
+            status_msg = self._verification_messages.get(e.id, "")
+            display_error = status_error or status_msg
+            can_redownload = bool(self._corrupt_files.get(e.id)) and not active
             rows.append({
                 "id": e.id,
                 "name": e.name,
@@ -1059,11 +1118,11 @@ class Backend(QObject):
                 "supported": supported,
                 "unsupportedReason": reason,
                 "installed": e.id in self._installed,
-                "downloading": downloading,
+                "downloading": active,
                 "progress": progress,
                 "progressText": progress_text,
                 "stage": stage,
-                "error": self._download_errors.get(e.id, ""),
+                "error": display_error,
                 "partial": partial > 0 and not downloading,
                 "loaded": e.id == loaded,
                 "loading": e.id == loading,
@@ -1073,6 +1132,7 @@ class Backend(QObject):
                 "compatReason": compat.reason,
                 "canDownload": compat.can_download,
                 "bestMatch": e.id in best.values(),
+                "canRedownload": can_redownload,
                 "contextLength": e.context_length,
             })
         if [r["id"] for r in rows] == [r["id"] for r in self.library.items()]:
@@ -1174,6 +1234,8 @@ class Backend(QObject):
         if not error:
             assert self.store is not None
             self._installed = self.store.installed()
+            self._corrupt_files.pop(model_id, None)
+            self._verification_messages.pop(model_id, None)
             self.toast.emit(f"{name} is ready to use.", "info")
         elif error != "cancelled":
             self._download_errors[model_id] = error
@@ -1189,6 +1251,132 @@ class Backend(QObject):
         downloader = self._downloads.get(model_id)
         if downloader:
             downloader.cancel()
+        self.cancelVerification(model_id)
+
+    @Slot(str)
+    def cancelVerification(self, model_id: str) -> None:  # noqa: N802
+        stop_event = self._verifications.get(model_id)
+        if stop_event:
+            stop_event.set()
+
+    @Slot(str)
+    def verifyModelFiles(self, model_id: str) -> None:  # noqa: N802
+        if self.store is None or model_id in self._downloads or model_id in self._verifications:
+            return
+        entry = self.registry.get(model_id)
+        if entry is None or not entry.supported:
+            return
+        model_dir = self.store.model_dir(model_id)
+        stop_event = threading.Event()
+        self._verifications[model_id] = stop_event
+        self._download_errors.pop(model_id, None)
+        self._verification_messages.pop(model_id, None)
+
+        def work() -> None:
+            try:
+                report = verify_installed_model(
+                    model_dir=model_dir,
+                    expected_files=entry.files,
+                    on_progress=self._verifyProgress.emit,
+                    should_stop=stop_event.is_set,
+                    model_id=model_id,
+                )
+                self._verifyFinished.emit(model_id, report, "")
+            except VerificationCancelled:
+                self._verifyFinished.emit(model_id, None, "cancelled")
+            except Exception as exc:  # pragma: no cover
+                log.exception("Verification failed for %s", model_id)
+                self._verifyFinished.emit(model_id, None, f"Verification failed: {exc}")
+
+        threading.Thread(target=work, name=f"verify-{model_id}", daemon=True).start()
+        self.refresh_library()
+
+    @Slot(object)
+    def _on_verify_progress(self, p: VerificationProgress) -> None:
+        row = self.library.find("id", p.model_id)
+        if row < 0 or p.model_id not in self._verifications:
+            return
+        text = f"Verifying {p.current_file}… {format_bytes(p.verified_bytes, precise=True)} of {format_bytes(p.total_bytes)}"
+        self.library.update(row, {"progress": p.fraction, "progressText": text, "stage": "verifying"})
+
+    @Slot(str, object, str)
+    def _on_verify_finished(self, model_id: str, report: ModelIntegrityReport | None, error: str) -> None:
+        self._verifications.pop(model_id, None)
+        entry = self.registry.get(model_id)
+        name = entry.name if entry else model_id
+
+        if error == "cancelled":
+            row = self.library.find("id", model_id)
+            if row >= 0:
+                self.library.update(row, {"progress": 0.0, "progressText": "", "stage": ""})
+            self.refresh_library()
+            return
+
+        if error:
+            self._verification_messages[model_id] = error
+            self.toast.emit(f"{name}: {error}", "error")
+        elif report is not None:
+            if report.all_ok:
+                self._corrupt_files.pop(model_id, None)
+                self._verification_messages[model_id] = "All files verified."
+                self.toast.emit(f"{name}: All files verified.", "info")
+            else:
+                failures = report.failed_files
+                self._corrupt_files[model_id] = [f.filename for f in failures]
+                fail_details = "; ".join(f"{f.filename}: {f.error_message}" for f in failures)
+                msg = f"Verification failed: {fail_details}"
+                self._verification_messages[model_id] = msg
+                self.toast.emit(f"{name}: {msg}", "error")
+
+        row = self.library.find("id", model_id)
+        if row >= 0:
+            self.library.update(row, {"progress": 0.0, "progressText": "", "stage": ""})
+        self.refresh_library()
+
+    @Slot(str)
+    def redownloadCorruptedFiles(self, model_id: str) -> None:  # noqa: N802
+        entry = self.registry.get(model_id)
+        if entry is None or self.store is None or model_id in self._downloads or model_id in self._verifications:
+            return
+        corrupt_names = set(self._corrupt_files.get(model_id, []))
+        if not corrupt_names:
+            corrupt_names = {f.filename for f in entry.files}
+        files_to_download = [f for f in entry.files if f.filename in corrupt_names]
+        if not files_to_download:
+            return
+
+        model_dir = self.store.model_dir(model_id)
+        for f in files_to_download:
+            (model_dir / f.filename).unlink(missing_ok=True)
+
+        self._installed = self.store.installed()
+        if self.runtime.loaded_model_id == model_id:
+            self.unloadModel()
+
+        downloader = ModelDownloader(
+            self.store,
+            entry,
+            on_progress=self._downloadProgress.emit,
+            files_to_download=files_to_download,
+        )
+        self._downloads[model_id] = downloader
+        self._download_errors.pop(model_id, None)
+        self._verification_messages.pop(model_id, None)
+
+        def work() -> None:
+            try:
+                downloader.download()
+                self._downloadFinished.emit(model_id, "")
+            except DownloadCancelled:
+                self._downloadFinished.emit(model_id, "cancelled")
+            except DownloadError as exc:
+                self._downloadFinished.emit(model_id, str(exc))
+            except Exception as exc:  # pragma: no cover
+                log.exception("Redownload repair failed")
+                self._downloadFinished.emit(model_id, f"Download failed: {exc}")
+
+        threading.Thread(target=work, name=f"redownload-{model_id}", daemon=True).start()
+        self.refresh_library()
 
     @Slot(str)
     def discardPartial(self, model_id: str) -> None:  # noqa: N802
@@ -1204,6 +1392,8 @@ class Backend(QObject):
         """Reason a model cannot be deleted right now, or "" if it can."""
         if self.runtime.loading_model_id == model_id:
             return "This model is loading. Wait for it to finish, then unload it."
+        if model_id in self._verifications:
+            return "This model is currently being verified. Cancel verification first."
         if self.runtime.loaded_model_id == model_id:
             if self.is_generating:
                 return "This model is generating a response. Stop it and unload the model first."
@@ -1287,14 +1477,15 @@ class Backend(QObject):
         if not hasattr(self.settings, key):
             log.warning("Unknown setting %s", key)
             return
-        current = getattr(self.settings, key)
         try:
-            value = type(current)(value)
-        except (TypeError, ValueError):
+            valid_value = Settings.validate_value(key, value)
+        except (TypeError, ValueError) as exc:
+            log.warning("Invalid setting %s=%r: %s", key, value, exc)
             return
-        if value == current:
+        current = getattr(self.settings, key)
+        if valid_value == current:
             return
-        setattr(self.settings, key, value)
+        setattr(self.settings, key, valid_value)
         self.settings.save(self.paths.settings_file)
         self.settingsChanged.emit()
         if key == "theme" and self._conversation:

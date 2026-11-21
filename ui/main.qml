@@ -24,6 +24,132 @@ ApplicationWindow {
     rightPadding: 0
     bottomPadding: 0
 
+    menuBar: MenuBar {
+        Menu {
+            title: qsTr("&File")
+            Action {
+                text: qsTr("New Chat")
+                shortcut: StandardKey.New
+                onTriggered: backend.newChat()
+            }
+            MenuSeparator {}
+            Action {
+                text: qsTr("Close Window")
+                shortcut: StandardKey.Close
+                onTriggered: window.close()
+            }
+        }
+
+        Menu {
+            title: qsTr("&Edit")
+            Action {
+                text: qsTr("Undo")
+                shortcut: StandardKey.Undo
+                onTriggered: {
+                    var item = window.activeFocusItem
+                    if (item && typeof item.undo === "function") item.undo()
+                }
+            }
+            Action {
+                text: qsTr("Redo")
+                shortcut: StandardKey.Redo
+                onTriggered: {
+                    var item = window.activeFocusItem
+                    if (item && typeof item.redo === "function") item.redo()
+                }
+            }
+            MenuSeparator {}
+            Action {
+                text: qsTr("Cut")
+                shortcut: StandardKey.Cut
+                onTriggered: {
+                    var item = window.activeFocusItem
+                    if (item && typeof item.cut === "function") item.cut()
+                }
+            }
+            Action {
+                text: qsTr("Copy")
+                shortcut: StandardKey.Copy
+                onTriggered: {
+                    var item = window.activeFocusItem
+                    if (item && typeof item.copy === "function") item.copy()
+                }
+            }
+            Action {
+                text: qsTr("Paste")
+                shortcut: StandardKey.Paste
+                onTriggered: {
+                    var item = window.activeFocusItem
+                    if (item && typeof item.paste === "function") item.paste()
+                }
+            }
+            Action {
+                text: qsTr("Select All")
+                shortcut: StandardKey.SelectAll
+                onTriggered: {
+                    var item = window.activeFocusItem
+                    if (item && typeof item.selectAll === "function") item.selectAll()
+                }
+            }
+        }
+
+        Menu {
+            title: qsTr("&View")
+            Action {
+                text: window.sidebarPinned ? qsTr("Hide Sidebar") : qsTr("Show Sidebar")
+                shortcut: "Ctrl+\\"
+                onTriggered: window.sidebarPinned = !window.sidebarPinned
+            }
+            Action {
+                text: qsTr("Search Chats…")
+                shortcut: "Ctrl+K"
+                onTriggered: { window.sidebarPinned = true; sidebar.focusSearch() }
+            }
+            MenuSeparator {}
+            Action {
+                text: qsTr("Model Library…")
+                shortcut: "Ctrl+Shift+M"
+                onTriggered: window.openLibrary("all")
+            }
+            Action {
+                text: qsTr("Settings…")
+                shortcut: StandardKey.Preferences
+                onTriggered: settingsDialog.open()
+            }
+            MenuSeparator {}
+            Action {
+                text: Theme.dark ? qsTr("Switch to Light Mode") : qsTr("Switch to Dark Mode")
+                shortcut: "Ctrl+Shift+L"
+                onTriggered: window.setAppearance("theme", Theme.dark ? "light" : "dark")
+            }
+        }
+
+        Menu {
+            title: qsTr("&Window")
+            Action {
+                text: qsTr("Minimize")
+                shortcut: "Ctrl+M"
+                onTriggered: window.showMinimized()
+            }
+            Action {
+                text: qsTr("Zoom")
+                onTriggered: window.toggleZoom()
+            }
+        }
+
+        Menu {
+            title: qsTr("&Help")
+            Action {
+                text: qsTr("SmolChat Documentation")
+                onTriggered: Qt.openUrlExternally("https://github.com/smollabs/smolchat-mac#readme")
+            }
+            Action {
+                text: qsTr("Report an Issue…")
+                onTriggered: Qt.openUrlExternally("https://github.com/smollabs/smolchat-mac/issues")
+            }
+        }
+    }
+
     property bool sidebarPinned: true
 
     Binding {

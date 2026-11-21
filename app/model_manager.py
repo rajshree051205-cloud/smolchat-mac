@@ -252,6 +252,197 @@ class DownloadError(Exception):
     pass
 
 
+class VerificationCancelled(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class FileIntegrityResult:
+    filename: str
+    status: str  # "ok" | "missing" | "unreadable" | "corrupt"
+    expected_sha256: str | None = None
+    actual_sha256: str | None = None
+    expected_size: int = 0
+    actual_size: int | None = None
+    error_message: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+
+@dataclass(frozen=True)
+class ModelIntegrityReport:
+    model_id: str
+    all_ok: bool
+    results: tuple[FileIntegrityResult, ...]
+
+    @property
+    def verified_files(self) -> list[FileIntegrityResult]:
+        return [r for r in self.results if r.ok]
+
+    @property
+    def failed_files(self) -> list[FileIntegrityResult]:
+        return [r for r in self.results if not r.ok]
+
+
+@dataclass
+class VerificationProgress:
+    model_id: str
+    verified_bytes: int
+    total_bytes: int
+    current_file: str = ""
+    stage: str = "verifying"
+
+    @property
+    def fraction(self) -> float:
+        return self.verified_bytes / self.total_bytes if self.total_bytes else 0.0
+
+
+VerificationProgressCallback = Callable[[VerificationProgress], None]
+
+
+def verify_installed_model(
+    model_dir: Path,
+    expected_files: Iterable[ModelFile],
+    on_progress: VerificationProgressCallback | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    model_id: str = "",
+) -> ModelIntegrityReport:
+    """Qt-free verification of installed model files against registry SHA-256 and size.
+
+    Supports chunked SHA-256 hashing, prompt cancellation during hashing,
+    and reports missing files, unreadable files, and hash mismatches.
+    """
+    files_list = list(expected_files)
+    total_bytes = sum(f.size for f in files_list)
+    done_before = 0
+    results: list[FileIntegrityResult] = []
+
+    for file in files_list:
+        if should_stop and should_stop():
+            raise VerificationCancelled("Verification cancelled")
+
+        target = model_dir / file.filename
+        if not target.exists():
+            results.append(
+                FileIntegrityResult(
+                    filename=file.filename,
+                    status="missing",
+                    expected_sha256=file.sha256,
+                    expected_size=file.size,
+                    error_message=f"Missing file: {file.filename}",
+                )
+            )
+            continue
+
+        if not target.is_file():
+            results.append(
+                FileIntegrityResult(
+                    filename=file.filename,
+                    status="unreadable",
+                    expected_sha256=file.sha256,
+                    expected_size=file.size,
+                    error_message=f"Not a regular file: {file.filename}",
+                )
+            )
+            continue
+
+        try:
+            stat = target.stat()
+            actual_size = stat.st_size
+        except OSError as exc:
+            results.append(
+                FileIntegrityResult(
+                    filename=file.filename,
+                    status="unreadable",
+                    expected_sha256=file.sha256,
+                    expected_size=file.size,
+                    error_message=f"Could not stat {file.filename}: {exc}",
+                )
+            )
+            continue
+
+        hasher = hashlib.sha256()
+        file_hashed = 0
+        read_error = ""
+
+        try:
+            with target.open("rb") as fh:
+                while chunk := fh.read(CHUNK_SIZE):
+                    if should_stop and should_stop():
+                        raise VerificationCancelled("Verification cancelled")
+                    hasher.update(chunk)
+                    file_hashed += len(chunk)
+                    if on_progress:
+                        on_progress(
+                            VerificationProgress(
+                                model_id=model_id,
+                                verified_bytes=done_before + file_hashed,
+                                total_bytes=total_bytes,
+                                current_file=file.filename,
+                                stage="verifying",
+                            )
+                        )
+        except OSError as exc:
+            read_error = str(exc)
+
+        if read_error:
+            results.append(
+                FileIntegrityResult(
+                    filename=file.filename,
+                    status="unreadable",
+                    expected_sha256=file.sha256,
+                    expected_size=file.size,
+                    actual_size=actual_size,
+                    error_message=f"Unreadable file {file.filename}: {read_error}",
+                )
+            )
+            done_before += file.size
+            continue
+
+        actual_sha256 = hasher.hexdigest()
+        if file.sha256 and actual_sha256.lower() != file.sha256.lower():
+            results.append(
+                FileIntegrityResult(
+                    filename=file.filename,
+                    status="corrupt",
+                    expected_sha256=file.sha256,
+                    actual_sha256=actual_sha256,
+                    expected_size=file.size,
+                    actual_size=actual_size,
+                    error_message=f"Checksum mismatch for {file.filename}",
+                )
+            )
+        elif actual_size != file.size:
+            results.append(
+                FileIntegrityResult(
+                    filename=file.filename,
+                    status="corrupt",
+                    expected_sha256=file.sha256,
+                    actual_sha256=actual_sha256,
+                    expected_size=file.size,
+                    actual_size=actual_size,
+                    error_message=f"Size mismatch for {file.filename} ({actual_size} != {file.size} bytes)",
+                )
+            )
+        else:
+            results.append(
+                FileIntegrityResult(
+                    filename=file.filename,
+                    status="ok",
+                    expected_sha256=file.sha256,
+                    actual_sha256=actual_sha256,
+                    expected_size=file.size,
+                    actual_size=actual_size,
+                )
+            )
+        done_before += file.size
+
+    all_ok = bool(results) and all(r.ok for r in results)
+    return ModelIntegrityReport(model_id=model_id, all_ok=all_ok, results=tuple(results))
+
+
 @dataclass
 class DownloadProgress:
     model_id: str
@@ -297,9 +488,11 @@ class ModelDownloader:
         on_progress: ProgressCallback | None = None,
         opener: Opener | None = None,
         timeout: float = 30.0,
+        files_to_download: Iterable[ModelFile] | None = None,
     ):
         self.store = store
         self.entry = entry
+        self.files_to_download = tuple(files_to_download) if files_to_download is not None else entry.files
         self.on_progress = on_progress or (lambda p: None)
         self._open = opener or (lambda req: urllib.request.urlopen(req, timeout=timeout))
         self._cancel = threading.Event()
@@ -319,12 +512,13 @@ class ModelDownloader:
         partial_dir.mkdir(parents=True, exist_ok=True)
         self._check_disk_space(partial_dir)
 
-        total = entry.download_size
+        files = self.files_to_download
+        total = sum(f.size for f in files)
         done_before = 0
         meter = _SpeedMeter()
         last_emit = 0.0
 
-        for file in entry.files:
+        for file in files:
             part = partial_dir / f"{file.filename}.part"
 
             def report(file_done: int, stage: str = "downloading", force: bool = False) -> None:
@@ -349,7 +543,7 @@ class ModelDownloader:
         # Every file verified: move into place atomically per file, then register.
         target = self.store.model_dir(entry.id)
         target.mkdir(parents=True, exist_ok=True)
-        for file in entry.files:
+        for file in files:
             (partial_dir / f"{file.filename}.part").replace(target / file.filename)
         shutil.rmtree(partial_dir, ignore_errors=True)
         installed = self.store.register(entry)
@@ -357,7 +551,7 @@ class ModelDownloader:
         return installed
 
     def _check_disk_space(self, directory: Path) -> None:
-        needed = self.entry.download_size - self.store.partial_bytes(self.entry.id)
+        needed = sum(f.size for f in self.files_to_download) - self.store.partial_bytes(self.entry.id)
         free = shutil.disk_usage(directory).free
         if needed > free - 200 * 1024**2:
             raise DownloadError(
