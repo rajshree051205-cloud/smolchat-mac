@@ -2,17 +2,59 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import sys
 
 from PySide6.QtCore import QMetaObject, Qt, QTimer, QUrl
 from PySide6.QtGui import QGuiApplication, QIcon
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 
 from app.backend import Backend, IconProvider
 from app.config import APP_NAME, APP_VERSION, ORG_NAME, AppPaths, configure_logging, resource_root
+from app.instance_lock import InstanceLock, activation_name
+
+
+def _notify_running_instance(name: str) -> bool:
+    """Ask the instance that owns this data folder to bring its window forward."""
+    sock = QLocalSocket()
+    sock.connectToServer(name)
+    if not sock.waitForConnected(1000):
+        return False
+    sock.write(b"raise\n")
+    sock.waitForBytesWritten(1000)
+    sock.disconnectFromServer()
+    return True
+
+
+def _listen_for_activation(name: str, windows: list) -> QLocalServer:
+    """Raise the main window whenever a second launch pings us.
+
+    Called right after the data lock is taken, before the slow start-up work, so a
+    second launch never finds the lock held but nobody listening. ``windows`` is
+    filled with the main window once it exists; pings before that are ignored.
+    """
+    QLocalServer.removeServer(name)  # safe: we hold the lock, so any socket file is stale
+    server = QLocalServer()
+    server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+    if not server.listen(name):
+        logging.getLogger(__name__).warning("Activation socket failed: %s", server.errorString())
+
+    def on_connection() -> None:
+        conn = server.nextPendingConnection()
+        if conn is None:
+            return
+        conn.disconnected.connect(conn.deleteLater)
+        if windows:
+            windows[0].show()
+            windows[0].raise_()
+            windows[0].requestActivate()
+
+    server.newConnection.connect(on_connection)
+    return server
 
 
 def main() -> int:
@@ -33,6 +75,17 @@ def main() -> int:
     for size in (157, 314, 627, 1254):
         icon.addFile(str(resource_root() / "resources" / "assets" / "logo" / f"logo-{size}.png"))
     app.setWindowIcon(icon)  # also the Dock icon on macOS
+
+    # Only one instance may use a data folder (SMOLCHAT_HOME gives separate folders).
+    # The OS drops the lock when the process exits, so a crash never leaves it stuck.
+    lock = InstanceLock(paths.data)
+    socket_name = activation_name(paths.data)
+    if not lock.acquire():
+        if not _notify_running_instance(socket_name):
+            print(f"SmolChat is already running for the data folder {paths.data}", file=sys.stderr)
+        return 0
+    main_window: list = []
+    activation_server = _listen_for_activation(socket_name, main_window)
 
     backend = Backend(paths)
 
@@ -57,6 +110,7 @@ def main() -> int:
     engine.load(QUrl.fromLocalFile(str(resource_root() / "ui" / "main.qml")))
     if not engine.rootObjects():
         return 1
+    main_window.append(engine.rootObjects()[0])
 
     app.aboutToQuit.connect(backend.shutdown)
     # Start background initialisation once the event loop (and splash) is running.
@@ -92,6 +146,8 @@ def main() -> int:
 
     code = app.exec()
     del engine  # tear down QML before the backend it binds to
+    activation_server.close()
+    lock.release()
     return code
 
 
