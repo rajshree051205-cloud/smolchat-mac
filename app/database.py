@@ -71,6 +71,11 @@ class ChatDatabase:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._conn.create_function(
+            "casefold", 1,
+            lambda v: v.casefold() if isinstance(v, str) else v,
+            deterministic=True,
+        )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA journal_mode = WAL")
@@ -110,9 +115,9 @@ class ChatDatabase:
             if query.strip():
                 like = f"%{_escape_like(query.strip())}%"
                 rows = self._conn.execute(
-                    "SELECT * FROM conversations c WHERE c.title LIKE ? ESCAPE '\\' OR EXISTS ("
+                    "SELECT * FROM conversations c WHERE casefold(c.title) LIKE casefold(?) ESCAPE '\\' OR EXISTS ("
                     " SELECT 1 FROM messages m WHERE m.conversation_id = c.id"
-                    " AND m.content LIKE ? ESCAPE '\\') ORDER BY c.updated_at DESC",
+                    " AND casefold(m.content) LIKE casefold(?) ESCAPE '\\') ORDER BY c.updated_at DESC",
                     (like, like),
                 ).fetchall()
             else:
