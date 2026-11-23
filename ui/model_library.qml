@@ -462,9 +462,8 @@ Popup {
                             visible: row.downloading
                             kind: "secondary"
                             compact: true
-                            text: row.stage === "verifying" ? "Verifying…" : "Cancel"
-                            enabled: row.stage !== "verifying"
-                            accessibleName: (row.stage === "verifying" ? "Verifying " : "Cancel download for ") + row.name
+                            text: "Cancel"
+                            accessibleName: "Cancel download for " + row.name
                             Layout.alignment: Qt.AlignRight
                             onClicked: backend.cancelDownload(row.id)
                         }
@@ -472,9 +471,10 @@ Popup {
                             visible: row.installed && row.canRedownload && !row.downloading
                             kind: "secondary"
                             compact: true
-                            text: "Use in this chat"
-                            accessibleName: "Use " + row.name + " in this chat"
-                            accessibleDescription: "Select this model for current conversation"
+                            iconName: "download"
+                            text: "Re-download"
+                            accessibleName: "Re-download " + row.name
+                            accessibleDescription: "Re-download corrupted or missing model files"
                             Layout.alignment: Qt.AlignRight
                             onClicked: backend.redownloadCorruptedFiles(row.id)
                         }
@@ -482,10 +482,14 @@ Popup {
                             visible: row.installed && !row.downloading
                             kind: "secondary"
                             compact: true
-                            iconName: "trash"
-                            text: "Delete"
-                            accessibleName: "Delete " + row.name
-                            accessibleDescription: "Remove model files from this Mac (" + row.sizeText + ")"
+                            text: "Use in this chat"
+                            accessibleName: "Use " + row.name + " in this chat"
+                            accessibleDescription: "Select this model for current conversation"
+                            Layout.alignment: Qt.AlignRight
+                            onClicked: { backend.selectModel(row.id); library.close() }
+                        }
+                        RowLayout {
+                            visible: row.installed && !row.downloading
                             Layout.alignment: Qt.AlignRight
                             spacing: 4
 
@@ -494,6 +498,8 @@ Popup {
                                 compact: true
                                 iconName: "trash"
                                 text: "Delete"
+                                accessibleName: "Delete " + row.name
+                                accessibleDescription: "Remove model files from this Mac (" + row.sizeText + ")"
                                 onClicked: {
                                     const blocker = backend.deleteBlocker(row.id)
                                     deleteDialog.modelId = row.id
@@ -510,6 +516,7 @@ Popup {
                                 iconName: "more"
                                 iconSize: 16
                                 tip: "Options"
+                                accessibleName: "More options for " + row.name
                                 onClicked: contextMenu.popup(moreBtn, 0, moreBtn.height)
                             }
                         }
