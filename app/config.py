@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import platform
+import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field, fields
@@ -28,7 +29,9 @@ log = logging.getLogger(__name__)
 
 APP_NAME = "SmolChat"
 ORG_NAME = "SmolWorks"
-APP_VERSION = "0.1.0"
+FALLBACK_VERSION = "0.0.0"
+
+_VERSION_RE = re.compile(r'^version\s*=\s*["\']([^"\']+)["\']', re.MULTILINE)
 
 
 def resource_root() -> Path:
@@ -37,6 +40,42 @@ def resource_root() -> Path:
     if frozen_root:
         return Path(frozen_root)
     return Path(__file__).resolve().parent.parent
+
+
+def read_project_version(pyproject: Path) -> str | None:
+    """Return ``[project] version`` from a ``pyproject.toml``, or None if absent.
+
+    Uses a regex rather than ``tomllib`` so it also works on Python 3.10.
+    """
+    try:
+        text = pyproject.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    project = re.search(r"^\[project\]\s*$(.*?)(?=^\[|\Z)", text, re.MULTILINE | re.DOTALL)
+    match = _VERSION_RE.search(project.group(1)) if project else None
+    return match.group(1).strip() if match else None
+
+
+def _app_version() -> str:
+    """The single source of truth is ``version`` in ``pyproject.toml``.
+
+    From source it is read directly; in the PyInstaller build the spec bundles
+    ``pyproject.toml`` next to ``ui/`` and ``resources/``. Installed package
+    metadata is only a fallback, because it can be stale after a version bump.
+    """
+    version = read_project_version(resource_root() / "pyproject.toml")
+    if version:
+        return version
+    try:
+        from importlib.metadata import PackageNotFoundError
+        from importlib.metadata import version as dist_version
+
+        return dist_version("smolchat")
+    except PackageNotFoundError:
+        return FALLBACK_VERSION
+
+
+APP_VERSION = _app_version()
 
 
 @dataclass(frozen=True)

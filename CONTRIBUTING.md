@@ -356,15 +356,15 @@ Remove anything private from logs and screenshots before posting.
 SmolChat uses an automated GitHub Actions release workflow (`.github/workflows/release.yml`) to build, test, package, and draft releases on version tags.
 
 ### 1. Where the application version is maintained
-The version string is maintained across the following files (keep them in sync):
-- `pyproject.toml` (authoritative): `[project] version = "X.Y.Z"`
-- `app/config.py`: `APP_VERSION = "X.Y.Z"`
-- `packaging/SmolChat.spec`: `"CFBundleShortVersionString": "X.Y.Z"`
+The version is written in exactly one place: `version = "X.Y.Z"` under `[project]` in `pyproject.toml`.
+Everything else reads it from there:
+- `app/config.py` sets `APP_VERSION` from `pyproject.toml` (shown in Settings and sent in the download `User-Agent`). The PyInstaller build bundles `pyproject.toml`, so this also works in the packaged app.
+- `packaging/SmolChat.spec` reads it for `CFBundleShortVersionString`, which `scripts/make_dmg.sh` uses for the DMG file name.
 
 ### 2. Updating the application version
-Before cutting a new release, bump the version string in `pyproject.toml`, `app/config.py`, and `packaging/SmolChat.spec`. Commit these changes to `main`:
+Before cutting a new release, change only the `version` in `pyproject.toml` and commit it to `main`:
 ```bash
-git add pyproject.toml app/config.py packaging/SmolChat.spec
+git add pyproject.toml
 git commit -m "Bump version to X.Y.Z"
 git push origin main
 ```
@@ -385,7 +385,7 @@ git push origin v1.2.3
 ### 5. How GitHub Actions builds the application
 Pushing a `v*` tag triggers the `Release` workflow on a `macos-14` (Apple Silicon ARM64) runner:
 1. Validates that the runner architecture is `arm64`.
-2. Validates that the tag version (without `v`) matches `pyproject.toml`, `app/config.py`, and `packaging/SmolChat.spec`.
+2. Validates that the tag version (without `v`) matches `pyproject.toml` and the `APP_VERSION` that `app/config.py` reads from it.
 3. Sets up Python 3.12 and installs dependencies with Metal GPU acceleration enabled (`CMAKE_ARGS="-DGGML_METAL=on"`).
 4. Runs the `pytest` test suite.
 5. Executes `scripts/build_macos.sh` to package `dist/SmolChat.app` via PyInstaller (without bundling model weights).

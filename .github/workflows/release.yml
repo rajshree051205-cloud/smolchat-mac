@@ -53,15 +53,6 @@ jobs:
           CONFIG_VERSION=$(python3 -c "import app.config; print(app.config.APP_VERSION)")
           echo "Application config version (app/config.py): ${CONFIG_VERSION}"
 
-          # Extract packaging/SmolChat.spec version using Python AST
-          SPEC_VERSION=$(python3 -c "import ast; tree = ast.parse(open('packaging/SmolChat.spec').read()); vals = [v.value for node in ast.walk(tree) if isinstance(node, ast.Dict) for k, v in zip(node.keys, node.values) if isinstance(k, ast.Constant) and k.value == 'CFBundleShortVersionString' and isinstance(v, ast.Constant)]; print(vals[0] if vals else '')")
-          echo "PyInstaller spec version (packaging/SmolChat.spec): ${SPEC_VERSION}"
-
-          if [ -z "${SPEC_VERSION}" ]; then
-            echo "Error: Could not extract CFBundleShortVersionString from packaging/SmolChat.spec" >&2
-            exit 1
-          fi
-
           if [ "${TAG_VERSION}" != "${APP_VERSION}" ]; then
             echo "Error: Tag version (${TAG_VERSION}) does not match pyproject.toml version (${APP_VERSION})" >&2
             exit 1
@@ -69,11 +60,6 @@ jobs:
 
           if [ "${APP_VERSION}" != "${CONFIG_VERSION}" ]; then
             echo "Error: pyproject.toml version (${APP_VERSION}) does not match app/config.py version (${CONFIG_VERSION})" >&2
-            exit 1
-          fi
-
-          if [ "${APP_VERSION}" != "${SPEC_VERSION}" ]; then
-            echo "Error: pyproject.toml version (${APP_VERSION}) does not match packaging/SmolChat.spec version (${SPEC_VERSION})" >&2
             exit 1
           fi
 
@@ -109,6 +95,13 @@ jobs:
             echo "Error: Executable $EXECUTABLE is missing or empty." >&2
             exit 1
           fi
+
+          BUNDLE_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist")
+          if [ "${BUNDLE_VERSION}" != "${VERSION}" ]; then
+            echo "Error: CFBundleShortVersionString (${BUNDLE_VERSION}) does not match pyproject.toml version (${VERSION})" >&2
+            exit 1
+          fi
+          echo "Verified: bundle version ${BUNDLE_VERSION} matches pyproject.toml."
 
           FILE_INFO=$(file "$EXECUTABLE")
           echo "Executable file info: $FILE_INFO"
