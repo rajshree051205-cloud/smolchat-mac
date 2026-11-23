@@ -1007,8 +1007,11 @@ Item {
                                     background: Rectangle { radius: 10; color: "#aa000000" }
                                     onClicked: {
                                         const list = composerArea.attachments.slice()
-                                        list.splice(thumb.index, 1)
+                                        const removed = list.splice(thumb.index, 1)
                                         composerArea.attachments = list
+                                        if (removed && removed.length > 0) {
+                                            backend.removeAttachment(removed[0])
+                                        }
                                     }
                                 }
                             }

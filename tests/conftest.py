@@ -16,7 +16,7 @@ def paths(tmp_path: Path) -> AppPaths:
     return p
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="session", autouse=True)
 def qapp():
     from PySide6.QtGui import QGuiApplication
 

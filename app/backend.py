@@ -286,6 +286,8 @@ class Backend(QObject):
         self._status_text = ""
         self._last_route = ""
 
+        self._clipboard_attachments: set[str] = set()
+
         self.conversations = DictListModel(
             ["id", "title", "section", "modelMode", "modelId", "updated"], self
         )
@@ -471,6 +473,7 @@ class Backend(QObject):
 
     @Slot()
     def newChat(self) -> None:  # noqa: N802
+        self.cleanupUnsentClipboardAttachments()
         self._conversation = None
         self._draft_mode = "manual" if self.settings.default_model_id else "auto"
         self._draft_model = self.settings.default_model_id
@@ -482,6 +485,7 @@ class Backend(QObject):
 
     @Slot(str)
     def openConversation(self, conversation_id: str) -> None:  # noqa: N802
+        self.cleanupUnsentClipboardAttachments()
         conv = self.db.get_conversation(conversation_id)
         if conv is None:
             self.toast.emit("That conversation no longer exists.", "error")
@@ -783,6 +787,8 @@ class Backend(QObject):
             return False
 
         stored_images = self._store_attachments(image_paths)
+        for img_path in stored_images:
+            self._clipboard_attachments.discard(img_path)
         if self._conversation is None:
             self._conversation = self.db.create_conversation(
                 suggest_title(text or "Image"), self._draft_model, self._draft_mode
@@ -834,37 +840,7 @@ class Backend(QObject):
         if mime_data is None:
             return {"status": "not_image"}
 
-        # 1. Check for direct image in clipboard
-        if mime_data.hasImage():
-            image = clipboard.image()
-            if image.isNull():
-                data = mime_data.imageData()
-                if isinstance(data, QImage) and not data.isNull():
-                    image = data
-
-            if not image.isNull():
-                if not self.visionAvailable:
-                    self.toast.emit(
-                        "Image attachments require a vision-capable model. "
-                        "Install or select one to paste images.",
-                        "info",
-                    )
-                    return {"status": "rejected", "reason": "no_vision"}
-
-                if current_count >= 4:
-                    self.toast.emit("Only up to 4 images can be attached per message.", "info")
-                    return {"status": "rejected", "reason": "limit_reached"}
-
-                self.paths.ensure()
-                dest = (self.paths.attachments / f"{uuid.uuid4().hex}.png").resolve()
-                if not image.save(str(dest), "PNG"):
-                    self.toast.emit("Could not save clipboard image.", "error")
-                    return {"status": "error", "reason": "save_failed"}
-
-                uri = dest.as_uri()
-                return {"status": "success", "path": uri, "paths": [uri]}
-
-        # 2. Check for file URLs pointing to images
+        # Priority A: Check file URLs pointing to local images first
         if mime_data.hasUrls():
             image_paths: list[str] = []
             for url in mime_data.urls():
@@ -875,13 +851,9 @@ class Backend(QObject):
                         image_paths.append(local_path)
 
             if image_paths:
+                # If vision is not available, do not block paste or error; return not_image so native text/URL paste proceeds
                 if not self.visionAvailable:
-                    self.toast.emit(
-                        "Image attachments require a vision-capable model. "
-                        "Install or select one to paste images.",
-                        "info",
-                    )
-                    return {"status": "rejected", "reason": "no_vision"}
+                    return {"status": "not_image"}
 
                 available_slots = max(0, 4 - current_count)
                 if available_slots <= 0:
@@ -896,7 +868,86 @@ class Backend(QObject):
                 uris = [Path(s).resolve().as_uri() for s in stored]
                 return {"status": "success", "path": uris[0], "paths": uris}
 
+        # Priority B: Check text before image data.
+        # Applications like Excel, Numbers, and Finder put image data alongside text/URLs.
+        # If the clipboard contains text, return not_image so the QML composer performs its normal text paste.
+        if mime_data.hasText() and mime_data.text():
+            return {"status": "not_image"}
+
+        # Priority C: Check direct image data only when there is no text
+        if mime_data.hasImage():
+            # If no vision model is installed/available, do not block paste or attach images
+            if not self.visionAvailable:
+                return {"status": "not_image"}
+
+            image = clipboard.image()
+            if image.isNull():
+                data = mime_data.imageData()
+                if isinstance(data, QImage) and not data.isNull():
+                    image = data
+
+            if not image.isNull():
+                if current_count >= 4:
+                    self.toast.emit("Only up to 4 images can be attached per message.", "info")
+                    return {"status": "rejected", "reason": "limit_reached"}
+
+                self.paths.ensure()
+                dest = (self.paths.attachments / f"{uuid.uuid4().hex}.png").resolve()
+                if not image.save(str(dest), "PNG"):
+                    self.toast.emit("Could not save clipboard image.", "error")
+                    return {"status": "error", "reason": "save_failed"}
+
+                dest_str = str(dest)
+                self._clipboard_attachments.add(dest_str)
+                uri = dest.as_uri()
+                return {"status": "success", "path": uri, "paths": [uri]}
+
         return {"status": "not_image"}
+
+    @Slot(str)
+    def removeAttachment(self, file_url_or_path: str) -> None:  # noqa: N802
+        """Clean up an unsent attachment removed from the composer if it was generated from the clipboard."""
+        p_str = QUrl(file_url_or_path).toLocalFile() if str(file_url_or_path).startswith("file:") else str(file_url_or_path)
+        try:
+            resolved = str(Path(p_str).resolve())
+        except Exception:
+            resolved = p_str
+
+        # Match against tracked clipboard attachments
+        target = None
+        for tracked in list(self._clipboard_attachments):
+            try:
+                if Path(tracked).resolve() == Path(resolved):
+                    target = tracked
+                    break
+            except Exception:
+                if tracked == resolved or tracked == p_str:
+                    target = tracked
+                    break
+
+        if target:
+            self._clipboard_attachments.discard(target)
+            try:
+                p = Path(target)
+                if p.is_relative_to(self.paths.attachments) and p.is_file():
+                    p.unlink(missing_ok=True)
+            except Exception as exc:
+                log.warning("Could not delete removed clipboard attachment %s: %s", target, exc)
+
+    @Slot(result=int)
+    def cleanupUnsentClipboardAttachments(self) -> int:  # noqa: N802
+        """Delete all untracked/abandoned clipboard attachments."""
+        cleaned = 0
+        for path_str in list(self._clipboard_attachments):
+            try:
+                p = Path(path_str)
+                if p.is_relative_to(self.paths.attachments) and p.is_file():
+                    p.unlink(missing_ok=True)
+                    cleaned += 1
+            except Exception as exc:
+                log.warning("Could not delete unsent clipboard attachment %s: %s", path_str, exc)
+        self._clipboard_attachments.clear()
+        return cleaned
 
     @Slot()
     def regenerate(self) -> None:
@@ -1643,5 +1694,6 @@ class Backend(QObject):
             d.cancel()
         if self._gen_thread is not None:
             self._gen_thread.join(timeout=5)
+        self.cleanupUnsentClipboardAttachments()
         self.runtime.unload()
         self.db.close()
