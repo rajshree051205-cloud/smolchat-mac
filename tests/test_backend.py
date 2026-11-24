@@ -18,7 +18,7 @@ import time
 from unittest.mock import MagicMock
 
 import pytest
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtGui import QGuiApplication
 
 from app.backend import Backend, DictListModel, _date_section
 from app.config import HardwareInfo, Settings
@@ -34,13 +34,7 @@ from app.model_manager import (
 )
 
 
-# Ensure a QCoreApplication exists in headless mode
-@pytest.fixture(scope="session", autouse=True)
-def qapp():
-    app = QCoreApplication.instance()
-    if app is None:
-        app = QCoreApplication([])
-    return app
+
 
 
 def create_test_model_entry(
@@ -412,7 +406,7 @@ class TestSendMessageLifecycle:
         if backend._gen_thread:
             backend._gen_thread.join(timeout=3.0)
 
-        QCoreApplication.processEvents()
+        QGuiApplication.processEvents()
 
         # Verify conversation was created
         assert backend.currentConversationId != ""
@@ -479,7 +473,7 @@ class TestStopGeneration:
         if backend._gen_thread:
             backend._gen_thread.join(timeout=3.0)
 
-        QCoreApplication.processEvents()
+        QGuiApplication.processEvents()
 
         conv = backend.db.get_conversation(backend.currentConversationId)
         msgs = backend.db.messages(conv.id)
@@ -504,7 +498,7 @@ class TestRegenerate:
         if backend._gen_thread:
             backend._gen_thread.join(timeout=3.0)
 
-        QCoreApplication.processEvents()
+        QGuiApplication.processEvents()
         assert backend.messages.count == 2
 
         # Change engine chunks for regenerated response
@@ -514,7 +508,7 @@ class TestRegenerate:
         if backend._gen_thread:
             backend._gen_thread.join(timeout=3.0)
 
-        QCoreApplication.processEvents()
+        QGuiApplication.processEvents()
 
         # Message count should still be 2 (old assistant replaced)
         msgs = backend.db.messages(backend.currentConversationId)

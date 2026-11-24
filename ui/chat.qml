@@ -1007,8 +1007,11 @@ Item {
                                     background: Rectangle { radius: 10; color: "#aa000000" }
                                     onClicked: {
                                         const list = composerArea.attachments.slice()
-                                        list.splice(thumb.index, 1)
+                                        const removed = list.splice(thumb.index, 1)
                                         composerArea.attachments = list
+                                        if (removed && removed.length > 0) {
+                                            backend.removeAttachment(removed[0])
+                                        }
                                     }
                                 }
                             }
@@ -1054,6 +1057,23 @@ Item {
                                     composerArea.send()
                                 }
                                 Keys.onEnterPressed: (event) => Keys.returnPressed(event)
+                                Keys.onPressed: (event) => {
+                                    if ((event.key === Qt.Key_V) && (event.modifiers === Qt.ControlModifier || event.modifiers === Qt.MetaModifier)) {
+                                        var res = backend.pasteImageFromClipboard(composerArea.attachments.length)
+                                        if (res && res.status !== "not_image") {
+                                            event.accepted = true
+                                            if (res.status === "success" && res.paths && res.paths.length > 0) {
+                                                var list = composerArea.attachments.slice()
+                                                for (var i = 0; i < res.paths.length; i++) {
+                                                    var p = res.paths[i]
+                                                    if (list.indexOf(p) < 0) list.push(p)
+                                                }
+                                                composerArea.attachments = list.slice(0, 4)
+                                            }
+                                            return
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
